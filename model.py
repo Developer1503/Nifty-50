@@ -1,114 +1,133 @@
-# ===============================
-# NIFTY 50 Stock Price Prediction
-# Ridge Regression (Time-Series)
-# ===============================
+# ============================================================
+# Multi-Stock ML Portfolio Strategy (NIFTY 50)
+# - Direction Classification
+# - Volatility Filter
+# - Walk-forward Retraining
+# - Equal-weight Portfolio
+# - Transaction Costs + Sharpe
+# ============================================================
 
+import kagglehub
 import pandas as pd
 import numpy as np
 
 from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import Ridge
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.linear_model import LogisticRegression
 
-# -------------------------------
+# ---------------------------
 # 1. Load Dataset
-# -------------------------------
-df = pd.read_csv("dataset/NIFTY50_all.csv")
+# ---------------------------
+path = kagglehub.dataset_download("rohanrao/nifty50-stock-market-data")
+df_all = pd.read_csv(f"{path}/NIFTY50_all.csv")
 
-df["Date"] = pd.to_datetime(df["Date"])
-df = df.sort_values("Date")
+df_all["Date"] = pd.to_datetime(df_all["Date"])
+df_all = df_all.sort_values("Date")
 
-# Filter one stock (RELIANCE)
-df = df[df["Symbol"] == "RELIANCE"].copy()
-df.reset_index(drop=True, inplace=True)
+# Stocks for portfolio
+STOCKS = ["RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK"]
 
-# -------------------------------
-# 2. Feature Engineering
-# -------------------------------
+TRANSACTION_COST = 0.001  # 0.1%
 
-# Returns & Momentum
-df["Return"] = df["Close"].pct_change()
-df["Momentum_4"] = df["Close"] - df["Close"].shift(4)
+portfolio_returns = []
 
-# Moving Averages
-df["MA_7"] = df["Close"].rolling(7).mean()
-df["MA_21"] = df["Close"].rolling(21).mean()
+# ---------------------------
+# 2. Loop Over Stocks
+# ---------------------------
+for stock in STOCKS:
 
-# Volatility
-df["Volatility_7"] = df["Close"].rolling(7).std()
+    df = df_all[df_all["Symbol"] == stock].copy()
+    df.reset_index(drop=True, inplace=True)
 
-# Lag Features
-df["Close_Lag1"] = df["Close"].shift(1)
-df["Close_Lag2"] = df["Close"].shift(2)
-df["Close_Lag3"] = df["Close"].shift(3)
+    # Feature engineering
+    df["Return"] = df["Close"].pct_change()
+    df["Momentum_4"] = df["Close"] - df["Close"].shift(4)
 
-# Target Variable (Next-day Close)
-df["Target"] = df["Close"].shift(-1)
+    df["MA_7"] = df["Close"].rolling(7).mean()
+    df["MA_21"] = df["Close"].rolling(21).mean()
 
-# Drop rows with NaN values
-df.dropna(inplace=True)
+    df["Volatility_7"] = df["Return"].rolling(7).std()
 
-# -------------------------------
-# 3. Feature & Label Selection
-# -------------------------------
-features = [
-    "Open", "High", "Low", "Close", "Volume",
-    "Return", "Momentum_4",
-    "MA_7", "MA_21",
-    "Volatility_7",
-    "Close_Lag1", "Close_Lag2", "Close_Lag3"
-]
+    df["Close_Lag1"] = df["Close"].shift(1)
+    df["Close_Lag2"] = df["Close"].shift(2)
+    df["Close_Lag3"] = df["Close"].shift(3)
 
-X = df[features]
-y = df["Target"]
+    df["Target_Direction"] = (df["Return"].shift(-1) > 0).astype(int)
 
-# -------------------------------
-# 4. Time-Series Train/Test Split
-# -------------------------------
-split_index = int(len(df) * 0.8)
+    df.dropna(inplace=True)
 
-X_train = X.iloc[:split_index]
-X_test  = X.iloc[split_index:]
+    features = [
+        "Return", "Momentum_4",
+        "MA_7", "MA_21",
+        "Volatility_7",
+        "Close_Lag1", "Close_Lag2", "Close_Lag3"
+    ]
 
-y_train = y.iloc[:split_index]
-y_test  = y.iloc[split_index:]
+    # Walk-forward parameters
+    train_size = int(len(df) * 0.6)
+    test_size = int(len(df) * 0.1)
 
-# -------------------------------
-# 5. Feature Scaling (Train Only)
-# -------------------------------
-scaler = StandardScaler()
+    vol_threshold = df["Volatility_7"].median()
+    stock_returns = []
 
-X_train_scaled = scaler.fit_transform(X_train)
-X_test_scaled = scaler.transform(X_test)
+    # Walk-forward loop
+    for start in range(0, len(df) - train_size - test_size, test_size):
 
-# -------------------------------
-# 6. Train Ridge Regression Model
-# -------------------------------
-model = Ridge(alpha=1.0)
-model.fit(X_train_scaled, y_train)
+        train = df.iloc[start:start + train_size]
+        test  = df.iloc[start + train_size:start + train_size + test_size]
 
-# -------------------------------
-# 7. Predictions
-# -------------------------------
-y_pred = model.predict(X_test_scaled)
+        X_train = train[features]
+        y_train = train["Target_Direction"]
 
-# -------------------------------
-# 8. Evaluation
-# -------------------------------
-mae = mean_absolute_error(y_test, y_pred)
-rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-r2 = r2_score(y_test, y_pred)
+        X_test = test[features]
+        y_test = test["Return"].shift(-1)
 
-print("Model Performance:")
-print(f"MAE  : {mae:.2f}")
-print(f"RMSE : {rmse:.2f}")
-print(f"R²   : {r2:.4f}")
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled  = scaler.transform(X_test)
 
-# -------------------------------
-# 9. Predict Next-Day Price
-# -------------------------------
-latest_data = X.iloc[[-1]]
-latest_scaled = scaler.transform(latest_data)
+        model = LogisticRegression(max_iter=1000)
+        model.fit(X_train_scaled, y_train)
 
-tomorrow_price = model.predict(latest_scaled)[0]
-print(f"\nPredicted next-day Close price: ₹{tomorrow_price:.2f}")
+        prob_up = model.predict_proba(X_test_scaled)[:, 1]
+
+        trade_allowed = test["Volatility_7"].values < vol_threshold
+
+        signals = np.where(
+            (prob_up > 0.55) & trade_allowed,  1,
+            np.where((prob_up < 0.45) & trade_allowed, -1, 0)
+        )
+
+        daily_returns = signals * y_test.values
+        costs = np.abs(signals) * TRANSACTION_COST
+        daily_returns = daily_returns - costs
+
+        stock_returns.extend(daily_returns)
+
+    portfolio_returns.append(pd.Series(stock_returns))
+
+# ---------------------------
+# 3. Portfolio Aggregation
+# ---------------------------
+portfolio_df = pd.concat(portfolio_returns, axis=1)
+portfolio_df.columns = STOCKS
+
+# Equal-weight portfolio
+portfolio_daily_returns = portfolio_df.mean(axis=1)
+
+# ---------------------------
+# 4. Portfolio Metrics
+# ---------------------------
+portfolio_daily_returns = portfolio_daily_returns.dropna()
+
+total_return = np.prod(1 + portfolio_daily_returns) - 1
+annual_volatility = portfolio_daily_returns.std() * np.sqrt(252)
+sharpe_ratio = (
+    portfolio_daily_returns.mean()
+    / portfolio_daily_returns.std()
+    * np.sqrt(252)
+)
+
+print("📈 MULTI-STOCK PORTFOLIO RESULTS")
+print(f"Total Return        : {total_return*100:.2f}%")
+print(f"Annual Volatility   : {annual_volatility*100:.2f}%")
+print(f"Sharpe Ratio        : {sharpe_ratio:.2f}")
